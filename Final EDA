@@ -1,4 +1,4 @@
-### This EDA is focused on AL, as a representation of the broader data
+### Final EDA after sourcing more data
 
 # Libraries
 import csv
@@ -13,40 +13,22 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
 # Read in preprocessed dataset
-AL_tornado_ds = xr.open_dataset("ERA5_SPC_merged.nc")
+tornado_ds = xr.open_dataset("ERA5_SPC_merged_2011_lowPL.nc")
 
 # Grab a slice and inspect structure
-AL_tornado_ds.isel(time=slice(0, 24))
-
-# Including dataset legend for reference
-legend_df = pd.read_excel("Dataset_Legend.xlsx")
-
-styled_legend = (
-    legend_df.style
-    .set_caption("ERA5 + SPC Tornado Dataset Variable Legend")
-    .hide(axis = "index")
-    .set_table_styles([
-        {'selector': 'caption', 'props': [('font-size', '18px'), ('font-weight', 'bold'), ('color', 'black'), ('text-align', 'left')]},
-        {'selector': 'th', 'props': [('background-color', 'darkblue'), ('color', 'white'), ('text-align', 'center'), ('font-weight', 'bold')]},
-        {'selector': 'td', 'props': [('padding', '8px'), ('border', '1px solid #ccc')]},
-        {'selector': 'table', 'props': [('border-collapse', 'collapse'), ('width', '100%')]}
-    ])
-    .apply(lambda _: ['background-color: #f9f9f9']*len(legend_df.columns), axis=1)
-)
-
-styled_legend
+tornado_ds.isel(valid_time=slice(0, 24))
 
 # Tornado class balance
-total_points = np.prod(AL_tornado_ds['tornado'].shape)
-num_tornado = int((AL_tornado_ds['tornado'] == 1).sum())
-num_notornado = int((AL_tornado_ds['tornado'] == 0).sum())
+total_points = np.prod(tornado_ds['tornado'].shape)
+num_tornado = int((tornado_ds['tornado'] == 1).sum())
+num_notornado = int((tornado_ds['tornado'] == 0).sum())
 
 print(f"Tornado points: {num_tornado:,}")
 print(f"Non-tornado points: {num_notornado:,}")
 print(f"Class ratio (tornado / total): {num_tornado / total_points:.6f}")
 
 # Subset for EDA Stats
-df = AL_tornado_ds.to_dataframe().reset_index()
+df = tornado_ds.to_dataframe().reset_index()
 df[['t2m', 'd2m', 'sp', 'cape', 'cin']].describe()
 
 # Compare mean differences for tornado/non-tornado
@@ -54,7 +36,7 @@ group_stats = df.groupby('tornado')[['t2m', 'd2m', 'cape', 'cin']].mean()
 display(group_stats)
 
 # Count tornadoes at each grid
-tornado_counts = AL_tornado_ds['tornado'].sum(dim='valid_time')
+tornado_counts = tornado_ds['tornado'].sum(dim='valid_time')
 
 # Cartopy for map projection
 proj = ccrs.PlateCarree()
