@@ -1,0 +1,420 @@
+#!pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+import xarray as xr
+import numpy as np
+import glob
+import os
+import re
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import WeightedRandomSampler
+from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
+
+### This is code to fix issues I didn't catch in ETL
+# Fixing merge issue, removing "time" and correctly using valid_time brought us down to 50% nan on PL vars
+# Read in a preprocessed dataset, get summary
+tornado_ds = xr.open_dataset("ERA5_SPC_merged_2012.nc")
+print(tornado_ds)
+
+# Check for NaNs (noticed issue on first training pass)
+vars_3d = ["t", "u", "v", "q"]
+for var in vars_3d:
+    data = tornado_ds[var].values
+    print(f"{var}: has NaNs? {np.isnan(data).any()}, count: {np.isnan(data).sum()}")
+
+# Check shapes and basic stats
+for var in vars_3d + ["tornado"]:
+    data = tornado_ds[var].values
+    print(f"{var}: shape={data.shape}, min={np.nanmin(data)}, max={np.nanmax(data)}")
+    
+# Exactly half are NaN, across all variables
+for var in ["t", "u", "v", "q"]:
+    print(var, np.isnan(tornado_ds[var]).sum(axis=(1,2,3)))  # NaNs per time step
+    
+#Found it, the three upper pressure levels are just empty. Will remove these
+ds = xr.open_dataset("ERA5_SPC_merged_2012.nc")
+var = "t"
+
+# NaNs per pressure level
+nan_counts = np.isnan(ds[var]).sum(axis=(0, 2, 3))  # sum over time, lat, lon
+total_per_level = ds.dims["valid_time"] * ds.dims["latitude"] * ds.dims["longitude"]
+
+for lvl, count in zip(ds.pressure_level.values, nan_counts):
+    print(f"Pressure {lvl} hPa: NaNs={count} / {total_per_level} ({100*count/total_per_level:.2f}%)")
+    
+# Let's quickly iterate over the ten files and just drop the empty pressure levels
+# This will retain the three lowest-elevation levels
+data_dir = r"C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/Model Testing"
+years = range(2011, 2021)
+
+# Levels to keep
+valid_levels = [850, 925, 1000]
+
+for year in years:
+    file_in = os.path.join(data_dir, f"ERA5_SPC_merged_{year}.nc")
+    file_out = os.path.join(data_dir, f"ERA5_SPC_merged_{year}_lowPL.nc")
+
+    # Open dataset
+    ds = xr.open_dataset(file_in, chunks={'valid_time': 24})
+
+    # Keep only low pressure levels
+    ds = ds.sel(pressure_level=valid_levels)
+
+    # Save back to NetCDF
+    ds.to_netcdf(file_out, engine="netcdf4", encoding={var: {'zlib': True} for var in ds.data_vars})
+    print(f"Saved reduced-pressure dataset for {year} to {file_out}")
+    
+# Noticed NaN contamination when including vars_2d, cin is culprit and is high so I will drop that one
+vars_2d = ["d2m", "t2m", "sp", "cape", "cin"]
+
+for var in vars_2d:
+    n_missing = np.isnan(ds[var].values).sum()
+    total = ds[var].values.size
+    print(f"{var}: {n_missing} NaNs out of {total} ({100*n_missing/total:.4f}%)")
+
+### Tie the whole thing together into a single pipeline for all datasets
+# Dataset class
+class TornadoDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# Setup files, identify vars_3d and output dir for saving tensors
+file_list = [
+    "ERA5_SPC_merged_2011_lowPL.nc",
+    "ERA5_SPC_merged_2012_lowPL.nc",
+    "ERA5_SPC_merged_2013_lowPL.nc",
+    "ERA5_SPC_merged_2014_lowPL.nc",
+    "ERA5_SPC_merged_2015_lowPL.nc",
+    "ERA5_SPC_merged_2016_lowPL.nc",
+    "ERA5_SPC_merged_2017_lowPL.nc",
+    "ERA5_SPC_merged_2018_lowPL.nc",
+    "ERA5_SPC_merged_2019_lowPL.nc",
+    "ERA5_SPC_merged_2020_lowPL.nc",
+]
+
+vars_3d = ["t", "u", "v", "q"]
+vars_2d = ["d2m", "t2m", "sp", "cape"]
+
+save_dir = "processed_tensors"
+os.makedirs(save_dir, exist_ok=True)
+
+X_train_list, y_train_list = [], []
+X_test_list, y_test_list = [], []
+
+# Process datasets and save tensors by year
+for i, file in enumerate(file_list):
+    # Extract year from filename using re
+    year = re.search(r"\d{4}", file).group()
+    print(f"Processing {year}...")
+
+    ds = xr.open_dataset(file)
+    
+    # Stack 3d variables: (valid_time, pressure, lat, lon, features)
+    X_3d = np.stack([ds[var].values for var in vars_3d], axis=-1)
+
+    vt, p, lat, lon, f = X_3d.shape
+    
+    # Expand 2d vars across pressure dimension
+    X_2d_list = []
+    for var in vars_2d:
+        field = ds[var].values                       # (time, lat, lon)
+        field_exp = np.repeat(field[:, None, :, :],  # (time, 1, lat, lon)
+                              repeats=p, axis=1)
+        X_2d_list.append(field_exp)
+    
+    # Shape: (time, pressure, lat, lon, features_2d)
+    X_2d = np.stack(X_2d_list, axis=-1)
+    f2 = len(vars_2d)
+    
+    # Final combined shape: (vt, p, lat, lon, f3 + f2)
+    X = np.concatenate([X_3d, X_2d], axis=-1)
+
+    # Flatten spatial dims: (vt*lat*lon, p, f_total)
+    vt, p, lat, lon, f_total = X.shape
+    X_flat = X.reshape(vt * lat * lon, p, f_total)
+
+    # Convert to PyTorch tensor (batch, features, pressure)
+    X_tensor = torch.tensor(X_flat, dtype=torch.float32).permute(0, 2, 1)
+
+    # Flatten tornado labels
+    y_tensor = torch.tensor(ds["tornado"].values.reshape(-1), dtype=torch.float32)
+
+    # Save
+    torch.save(X_tensor, os.path.join(save_dir, f"X_{year}.pt"))
+    torch.save(y_tensor, os.path.join(save_dir, f"y_{year}.pt"))
+    print(f"Saved tensors for {year}: X={X_tensor.shape}, y={y_tensor.shape}")
+
+    # Train/test split by year
+    if i < 8:
+        X_train_list.append(X_tensor)
+        y_train_list.append(y_tensor)
+    else:
+        X_test_list.append(X_tensor)
+        y_test_list.append(y_tensor)
+
+# Concatenate train/test tensors
+X_train = torch.cat(X_train_list, dim=0)
+y_train = torch.cat(y_train_list, dim=0)
+X_test  = torch.cat(X_test_list, dim=0)
+y_test  = torch.cat(y_test_list, dim=0)
+
+print("Before standardization:")
+print("X_train min/max:", X_train.min().item(), X_train.max().item())
+
+# Standardize using training stats
+X_mean = X_train.mean(dim=0, keepdim=True)
+X_std  = X_train.std(dim=0, keepdim=True)
+
+X_train = (X_train - X_mean) / (X_std + 1e-6)
+X_test  = (X_test  - X_mean) / (X_std + 1e-6)
+
+print("After standardization:")
+print("X_train min/max:", X_train.min().item(), X_train.max().item())
+
+# Create train/test datasets
+train_dataset = TornadoDataset(X_train, y_train)
+test_dataset  = TornadoDataset(X_test, y_test)
+
+# Upsample y positives
+y_train_int = y_train.to(torch.int64)
+pos_idx = torch.where(y_train_int == 1)[0]
+neg_idx = torch.where(y_train_int == 0)[0]
+
+target_pos_frac = 0.02
+num_neg = len(neg_idx)
+
+# How many positives do we need for the desired fraction?
+num_pos_target = int((target_pos_frac / (1 - target_pos_frac)) * num_neg)
+
+# Oversample the positives to reach target count
+num_pos_target = max(num_pos_target, len(pos_idx))
+pos_idx_upsampled = pos_idx[torch.randint(0, len(pos_idx), (num_pos_target,))]
+
+# Combine
+combined_idx = torch.cat([neg_idx, pos_idx_upsampled])
+
+# Shuffle
+perm = torch.randperm(len(combined_idx))
+combined_idx = combined_idx[perm]
+
+# Subset for DataLoader
+train_subset = Subset(train_dataset, combined_idx)
+train_loader = DataLoader(train_subset, batch_size=512, shuffle=True)
+test_loader  = DataLoader(test_dataset, batch_size=512, shuffle=False)
+
+# Check result
+batch_X, batch_y = next(iter(train_loader))
+pos_frac = (batch_y == 1).float().mean().item()
+print(f"Sampled batch positive fraction (approx): {pos_frac:.3f}")
+print("Training set:", X_train.shape, y_train.shape)
+print("Testing set: ", X_test.shape, y_test.shape)
+
+# Here's the CNN
+class TornadoCNN(nn.Module):
+    def __init__(self, n_features = 8, n_pressure = 3, hidden_channels = 24, dropout_prob=0.2):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(n_features, hidden_channels, kernel_size=2, padding=1)
+        self.bn1   = nn.BatchNorm1d(hidden_channels)
+        self.drop1 = nn.Dropout(dropout_prob)
+
+        self.conv2 = nn.Conv1d(hidden_channels, hidden_channels, kernel_size=2, padding=1)
+        self.bn2   = nn.BatchNorm1d(hidden_channels)
+        self.drop2 = nn.Dropout(dropout_prob)
+
+        self.conv3 = nn.Conv1d(hidden_channels, hidden_channels, kernel_size=2, padding=1)
+        self.bn3   = nn.BatchNorm1d(hidden_channels)
+        self.drop3 = nn.Dropout(dropout_prob)
+
+        self.conv4 = nn.Conv1d(hidden_channels, hidden_channels, kernel_size=2, padding=1)
+        self.bn4   = nn.BatchNorm1d(hidden_channels)
+        self.drop4 = nn.Dropout(dropout_prob)
+
+        # Final output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, n_features, n_pressure)
+            out = self.forward_conv(dummy)
+            conv_output_size = out.shape[1] * out.shape[2]
+
+        # Fully connected
+        self.fc = nn.Linear(conv_output_size, 1)
+
+    def forward_conv(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.drop1(x)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.drop2(x)
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.drop3(x)
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = self.drop4(x)
+
+        return x
+
+    def forward(self, x):
+        x = self.forward_conv(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+# Set up to train, use GPU, define optimizer and loss function, epochs = 5 (pretty much ripped directly from Deep Learning)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+pos_weight = torch.tensor([5], dtype=torch.float32).to(device)
+model = TornadoCNN(n_features=8, n_pressure=3, hidden_channels=24).to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+num_epochs = 25
+# For early stop
+patience = 3
+best_loss = float("inf")
+no_improve = 0
+
+# Here's the training loop
+# Batching because using local GPU
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    
+    # Training loop
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        logits = model(batch_X)
+        batch_y = batch_y.view(-1, 1)
+        loss = loss_fn(logits, batch_y)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * batch_X.size(0)
+    
+    epoch_loss = running_loss / len(train_loader.dataset)
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+    
+    # Early Stopping
+    if epoch_loss < best_loss - 1e-4:
+        best_loss = epoch_loss
+        no_improve = 0
+    else:
+        no_improve += 1
+        if no_improve >= patience:
+            print(f"Stopping early at epoch {epoch+1} (no improvement for {patience} epochs)")
+            break
+
+# Training evaluation
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.eval()
+
+all_probs, all_labels = [], []
+
+with torch.no_grad():
+    for batch_X, batch_y in train_loader: # switch to test_loader for test eval
+        batch_X = batch_X.to(device)
+        batch_y = batch_y.to(device)
+        logits = model(batch_X)
+        probs = torch.sigmoid(logits)
+        all_probs.append(probs.cpu())
+        all_labels.append(batch_y.cpu())
+
+all_probs = torch.cat(all_probs).numpy().ravel()
+all_labels = torch.cat(all_labels).numpy().ravel()
+
+# PR-AUC
+pr_auc = average_precision_score(all_labels, all_probs)
+print(f"\nPR-AUC (Average Precision): {pr_auc:.4f}\n")
+
+# Threshold sweep
+thresholds = np.arange(0.05, 0.96, 0.01)
+best_recall1_prec = 0.0
+best_recall1_thresh = None
+best_f1 = 0.0
+best_f1_thresh = None
+
+print(f"{'Thresh':>7} {'F1':>7} {'Prec':>7} {'Rec':>7}")
+for t in thresholds:
+    preds = (all_probs > t).astype(float)
+    prec = precision_score(all_labels, preds, zero_division=0)
+    rec = recall_score(all_labels, preds, zero_division=0)
+    f1 = f1_score(all_labels, preds, zero_division=0)
+    print(f"{t:7.3f} {f1:7.4f} {prec:7.4f} {rec:7.4f}")
+
+    if rec == 1.0 and prec > best_recall1_prec:
+        best_recall1_prec = prec
+        best_recall1_thresh = t
+    if f1 > best_f1:
+        best_f1 = f1
+        best_f1_thresh = t
+
+print("\nBest F1 overall:")
+print(f"  Threshold={best_f1_thresh:.3f}, F1={best_f1:.4f}")
+
+if best_recall1_thresh is not None:
+    print("\nBest precision with recall=1.0:")
+    print(f"  Threshold={best_recall1_thresh:.3f}, Precision={best_recall1_prec:.4f}")
+else:
+    print("\nNo threshold achieved perfect recall.")
+
+# Test evaluation
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.eval()
+
+all_probs, all_labels = [], []
+
+with torch.no_grad():
+    for batch_X, batch_y in test_loader:   # switch to test_loader for test eval
+        batch_X = batch_X.to(device)
+        batch_y = batch_y.to(device)
+        logits = model(batch_X)
+        probs = torch.sigmoid(logits)
+        all_probs.append(probs.cpu())
+        all_labels.append(batch_y.cpu())
+
+all_probs = torch.cat(all_probs).numpy().ravel()
+all_labels = torch.cat(all_labels).numpy().ravel()
+
+# PR-AUC
+pr_auc = average_precision_score(all_labels, all_probs)
+print(f"\nPR-AUC (Average Precision): {pr_auc:.4f}\n")
+
+# Threshold sweep
+thresholds = np.arange(0.05, 0.96, 0.01)
+best_recall1_prec = 0.0
+best_recall1_thresh = None
+best_f1 = 0.0
+best_f1_thresh = None
+
+print(f"{'Thresh':>7} {'F1':>7} {'Prec':>7} {'Rec':>7}")
+for t in thresholds:
+    preds = (all_probs > t).astype(float)
+    prec = precision_score(all_labels, preds, zero_division=0)
+    rec = recall_score(all_labels, preds, zero_division=0)
+    f1 = f1_score(all_labels, preds, zero_division=0)
+    print(f"{t:7.3f} {f1:7.4f} {prec:7.4f} {rec:7.4f}")
+
+    if rec == 1.0 and prec > best_recall1_prec:
+        best_recall1_prec = prec
+        best_recall1_thresh = t
+    if f1 > best_f1:
+        best_f1 = f1
+        best_f1_thresh = t
+
+print("\nBest F1 overall:")
+print(f"  Threshold={best_f1_thresh:.3f}, F1={best_f1:.4f}")
+
+if best_recall1_thresh is not None:
+    print("\nBest precision with recall=1.0:")
+    print(f"  Threshold={best_recall1_thresh:.3f}, Precision={best_recall1_prec:.4f}")
+else:
+    print("\nNo threshold achieved perfect recall.")
+
