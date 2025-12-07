@@ -1,0 +1,113 @@
+### This is to isolate tornado reports from SPC tornado report data, and attach them to the ERA5 merged data, these are the y_pos hits for classification
+
+import csv
+import pandas as pd
+import xarray as xr
+import numpy as np
+
+### Looping was causing issues, so I manually ran these to join my datasets
+# Read SPC data
+SPC_raw = pd.read_csv("SPC_2020.csv", low_memory=False)
+
+# Filter by year/month (March–May 2011)
+valid_months = ["202003", "202004", "202005"]
+SPC_filtered = SPC_raw[SPC_raw["BEGIN_YEARMONTH"].astype(str).isin(valid_months)]
+
+# Keep only county-level records (CZ_TYPE = 'C')
+SPC_filtered = SPC_filtered[SPC_filtered["CZ_TYPE"] == "C"]
+
+# Filter by ERA5 bounding box
+lat_min, lat_max = 30.0, 35.0
+lon_min, lon_max = -88.5, -85.0
+
+SPC_filtered = SPC_filtered[
+    (SPC_filtered["BEGIN_LAT"] >= lat_min) &
+    (SPC_filtered["BEGIN_LAT"] <= lat_max) &
+    (SPC_filtered["BEGIN_LON"] >= lon_min) &
+    (SPC_filtered["BEGIN_LON"] <= lon_max)
+]
+
+# Relevant columns
+cols_to_keep = ["BEGIN_DATE_TIME", "STATE", "EVENT_TYPE", "CZ_TYPE", "BEGIN_LAT", "BEGIN_LON"]
+SPC_filtered = SPC_filtered[cols_to_keep].reset_index(drop=True)
+
+# Encode tornadic events
+tornado_events = ["Debris Flow", "Dust Devil", "Funnel Cloud", "Tornado"]
+SPC_filtered["is_tornado"] = SPC_filtered["EVENT_TYPE"].isin(tornado_events).astype(int)
+
+# Save cleaned SPC data
+SPC_filtered.to_csv("SPC_clean_2020.csv", index=False)
+
+# Summary
+print(f"Final filtered dataset shape: {SPC_filtered.shape}")
+print(SPC_filtered.head())
+print("Counts by is_tornado value:")
+print(SPC_filtered["is_tornado"].value_counts())
+
+### Converting datetime to match format for ERA5, create 3D array for tornado var, merge into ERA5
+# Open PL+SL dataset
+merged_ds = xr.open_dataset("ERA5_PL_SL_2020.nc", chunks={'valid_time': 24})
+
+# Cleaned SPC data
+SPC_clean = pd.read_csv("SPC_Clean_2020.csv", low_memory=False)
+
+# Convert SPC timestamps to datetime64 in UTC, round down to hour
+SPC_clean['BEGIN_DATE_TIME'] = pd.to_datetime(
+    SPC_clean['BEGIN_DATE_TIME'], 
+    format='%d-%b-%y %H:%M:%S', 
+    errors='coerce'
+).dt.tz_localize('US/Central', ambiguous='NaT', nonexistent='NaT') \
+ .dt.tz_convert('UTC') \
+ .dt.tz_localize(None)
+
+SPC_clean['BEGIN_DATE_HOUR'] = SPC_clean['BEGIN_DATE_TIME'].dt.floor('H')
+
+# Empty 3D tornado array matching ERA5 grid
+tornado_3d = xr.DataArray(
+    np.zeros((merged_ds.dims['valid_time'], merged_ds.dims['latitude'], merged_ds.dims['longitude'])),
+    coords={'valid_time': merged_ds['valid_time'],
+            'latitude': merged_ds['latitude'],
+            'longitude': merged_ds['longitude']},
+    dims=['valid_time', 'latitude', 'longitude'],
+    name='tornado'
+)
+
+# Convert SPC times to numpy.datetime64 to match ERA5 (resolves continuing mismatch issue)
+spc_times_np = SPC_clean['BEGIN_DATE_HOUR'].values.astype('datetime64[ns]')
+
+# Match tornadoes to nearest ERA5 grid/time
+for idx, row in SPC_clean.iterrows():
+    time_idx = np.searchsorted(merged_ds['valid_time'].values, np.datetime64(row['BEGIN_DATE_HOUR']))
+    time_idx = min(time_idx, len(merged_ds['valid_time']) - 1)
+    lat_idx = np.argmin(np.abs(merged_ds['latitude'].values - row['BEGIN_LAT']))
+    lon_idx = np.argmin(np.abs(merged_ds['longitude'].values - row['BEGIN_LON']))
+    
+    tornado_3d[time_idx, lat_idx, lon_idx] = 1
+
+# Merge tornado variable into ERA5 dataset
+merged_ds = xr.merge([merged_ds, tornado_3d])
+
+# Save as NetCDF
+merged_ds.to_netcdf("ERA5_SPC_merged_2020.nc")
+
+#### Combining sanity checks
+# merged_ds dimensions
+print(merged_ds)
+print("Dimensions:", merged_ds.dims)
+print("Variables:", list(merged_ds.data_vars))
+
+# Check shape
+print("tornado shape:", merged_ds['tornado'].shape)
+
+# Check for NaNs
+print("Any NaNs?", merged_ds['tornado'].isnull().any().item())
+
+# Check unique values
+print("Unique values:", np.unique(merged_ds['tornado'].values))
+
+# Are there any tornadoes at all?
+print((merged_ds['tornado'] == 1).any().item())
+
+# Count of tornado occurrences
+print((merged_ds['tornado'] == 1).sum().item())
+print((merged_ds['tornado'] == 0).sum().item())
