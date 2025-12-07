@@ -1,0 +1,232 @@
+### ETL consists of concatenating the split pressure levels, then the months
+### Pressure level and single level datasets merged on valid_time
+### This results in ten datasets, one for each year (for memory limitation)
+
+
+# Libraries
+import csv
+import os
+import re
+import xarray as xr
+import numpy as np
+import pandas as pd
+
+### PL files
+# Path to your directory containing all the .nc files
+data_dir = "C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/API Request"
+
+# Get all pressure-level files
+all_files = [f for f in os.listdir(data_dir) if re.match(r"ERA5_PL_\d{4}_\d{2}_grp\d_days\d\.nc", f)]
+
+# Extract unique years and months
+pattern = r"ERA5_PL_(\d{4})_(\d{2})_grp(\d)_days(\d)\.nc"
+matches = [re.match(pattern, f) for f in all_files]
+years = sorted(set(int(m.group(1)) for m in matches))
+months = sorted(set(m.group(2) for m in matches))  # as strings for zero-padding
+
+# Utility function: drop 'time', keep 'valid_time'
+def keep_valid_time(ds):
+    if 'time' in ds.dims:
+        ds = ds.drop_dims('time', errors='ignore')
+    return ds
+
+# Loop through each year
+for year in years:
+    monthly_datasets = []
+
+    for month in months:
+        group_datasets = []
+        
+        for grp in ["grp1", "grp2"]:
+            # Collect the three 10-day chunks for this group and month
+            chunk_files = sorted([
+                os.path.join(data_dir, f)
+                for f in all_files
+                if f.startswith(f"ERA5_PL_{year}_{month}_{grp}_days")
+            ])
+
+            if not chunk_files:
+                print(f"Missing files {year}-{month} {grp}, skipping.")
+                continue
+
+            # Open and clean chunks
+            ds_chunks = [
+                keep_valid_time(
+                    xr.open_dataset(f, chunks={'time': 24}).drop_vars(["expver", "number"], errors='ignore')
+                )
+                for f in chunk_files
+            ]
+
+            # Concatenate the 10-day segments for this group
+            grp_ds = xr.concat(ds_chunks, dim="valid_time")
+
+            group_datasets.append(grp_ds)
+
+        if len(group_datasets) == 2:
+            # Merge grp1 and grp2 (same valid_time dimension, different pressure levels)
+            month_ds = xr.merge(group_datasets, compat="override")
+            monthly_datasets.append(month_ds)
+        else:
+            print(f"No data for {year}-{month}, skipping month.")
+
+    # Concatenate the three months into one continuous yearly dataset
+    if monthly_datasets:
+        year_ds = xr.concat(monthly_datasets, dim="valid_time")
+
+        # Save to NetCDF
+        out_path = os.path.join(data_dir, f"ERA5_PL_{year}_merged.nc")
+        year_ds.to_netcdf(
+            out_path,
+            engine="netcdf4",
+            encoding={var: {'zlib': True} for var in year_ds.data_vars}
+        )
+        print(f"Saved {out_path}")
+    else:
+        print(f"No months found for {year}")
+
+### Checking structure, dims
+# Path to a yearly PL file
+pl_file = r"C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/API Request/ERA5_PL_2015_merged.nc"
+
+# Open the dataset
+ds = xr.open_dataset(pl_file, chunks={'time': 24})
+
+# Check basic information
+print(ds)
+
+# Check dimensions
+print("\nDimensions:")
+for dim, size in ds.dims.items():
+    print(f"{dim}: {size}")
+
+# Optional: Inspect the first few valid_time entries
+print("\nFirst 10 valid_time values:")
+print(ds['valid_time'].values[:10])
+
+### SL files
+data_dir = r"C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/API Request"
+
+# Collect all single-level files
+all_files = [f for f in os.listdir(data_dir) if re.match(r"ERA5_SL_\d{4}_\d{2}_days\d\.nc", f)]
+
+# Extract unique years and months
+pattern = r"ERA5_SL_(\d{4})_(\d{2})_days\d\.nc"
+matches = [re.match(pattern, f) for f in all_files]
+years = sorted(set(int(m.group(1)) for m in matches))
+months = sorted(set(m.group(2) for m in matches))  # strings, zero-padded
+
+# Utility function: drop 'time', keep 'valid_time'
+def keep_valid_time(ds):
+    if 'time' in ds.dims:
+        ds = ds.drop_dims('time', errors='ignore')
+    return ds
+
+for year in years:
+    monthly_datasets = []
+
+    for month in months:
+        # Grab all 10-day chunks for this month
+        chunk_files = sorted([
+            os.path.join(data_dir, f)
+            for f in all_files
+            if f.startswith(f"ERA5_SL_{year}_{month}_days")
+        ])
+
+        if not chunk_files:
+            print(f"Missing SL files {year}-{month}, skipping.")
+            continue
+
+        # Open and clean chunks
+        ds_chunks = [
+            keep_valid_time(
+                xr.open_dataset(f, chunks={'time': 24}).drop_vars(["expver", "number"], errors='ignore')
+            )
+            for f in chunk_files
+        ]
+
+        # Concatenate chunks along valid_time
+        month_ds = xr.concat(ds_chunks, dim="valid_time")
+        monthly_datasets.append(month_ds)
+
+    if monthly_datasets:
+        # Concatenate the three months into one yearly SL dataset
+        year_ds = xr.concat(monthly_datasets, dim="valid_time")
+
+        # Save yearly dataset to disk
+        out_path = os.path.join(data_dir, f"ERA5_SL_{year}_merged.nc")
+        year_ds.to_netcdf(
+            out_path,
+            mode="w",
+            engine="netcdf4",
+            encoding={var: {'zlib': True} for var in year_ds.data_vars}
+        )
+        print(f"Saved yearly SL dataset: {out_path}")
+    else:
+        print(f"No data found for SL year {year}")
+
+### Drop time in favor of valid_time, merge PL/SL files
+data_dir = r"C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/API Request"
+years = range(2011, 2020)
+
+# Utility function: drop 'time' and keep 'valid_time'
+def keep_valid_time(ds):
+    if 'time' in ds.dims:
+        ds = ds.drop_dims('time', errors='ignore')
+    return ds
+
+for year in years:
+    print(f"\nProcessing year {year}...")
+
+    # Open yearly PL and SL datasets
+    pl_file = os.path.join(data_dir, f"ERA5_PL_{year}_merged.nc")
+    sl_file = os.path.join(data_dir, f"ERA5_SL_{year}_merged.nc")
+
+    pl_ds = keep_valid_time(
+        xr.open_dataset(pl_file, chunks={'time': 24}).drop_vars(["expver", "number"], errors="ignore")
+    )
+    sl_ds = keep_valid_time(
+        xr.open_dataset(sl_file, chunks={'time': 24}).drop_vars(["expver", "number"], errors="ignore")
+    )
+
+    # Merge PL and SL along shared coordinates
+    merged_ds = xr.merge([pl_ds, sl_ds], compat="override")
+
+    # Save merged yearly dataset
+    out_file = os.path.join(data_dir, f"ERA5_PL_SL_{year}.nc")
+    merged_ds.to_netcdf(
+        out_file,
+        mode="w",
+        engine="netcdf4",
+        encoding={var: {'zlib': True} for var in merged_ds.data_vars}
+    )
+
+    # Close datasets to free memory
+    merged_ds.close()
+    pl_ds.close()
+    sl_ds.close()
+
+    print(f"Saved merged PL+SL dataset for {year} to {out_file}")
+
+### More sanity checks
+merged_file = r"C:/Users/Ian/Documents/School_Stuff/DS785 Capstone/API Request/ERA5_PL_SL_2015.nc"
+
+# Open the dataset
+ds = xr.open_dataset(merged_file, chunks={'valid_time': 24})
+print(ds)
+
+# Dimensions
+print("\nDimensions:")
+for dim, size in ds.dims.items():
+    print(f"{dim}: {size}")
+
+# First 10 valid_time entries
+print("\nFirst 10 valid_time values:")
+print(ds['valid_time'].values[:10])
+
+# Variables present
+print("\nVariables:")
+print(list(ds.data_vars))
+
+# Check shapes
+for var in ds.data_vars:
+    print(f"{var}: {ds[var].shape}")
