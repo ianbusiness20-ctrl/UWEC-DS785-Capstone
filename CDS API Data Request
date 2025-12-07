@@ -1,0 +1,107 @@
+### This is the data request, from after I decided to increase the amount of training data
+### Most of the CDSAPI code is available on the Copernicus Climate Data Store, ChatGPT assisted in tailoring this to my needs for vars
+### These request the data packs, and save them into the same filepath as the .ipynb file
+
+import cdsapi
+import os
+
+### Pressure Levels data request
+c = cdsapi.Client()
+
+years = range(2011, 2021)
+months = ['03', '04', '05']
+hours = [f"{h:02d}:00" for h in range(0, 24)]
+
+area = [37.5, -93.0, 30.5, -80.5]  # [N, W, S, E]
+
+# Pressure-level variables
+pl_vars = [
+    "geopotential", "specific_humidity", "temperature",
+    "u_component_of_wind", "v_component_of_wind", "vorticity"
+]
+
+# Split pressure levels into two groups
+pl_levels_groups = [
+    ["1000", "925", "850"],
+    ["700", "500", "300"]
+]
+
+# Split month into 10-day batches
+days_groups = [
+    [f"{d:02d}" for d in range(1, 11)],
+    [f"{d:02d}" for d in range(11, 21)],
+    [f"{d:02d}" for d in range(21, 32)]
+]
+
+# Pressure-level
+for year in years:
+    for month in months:
+        for i, levels in enumerate(pl_levels_groups):
+            for j, days in enumerate(days_groups):
+                output_file = f"ERA5_PL_{year}_{month}_grp{i+1}_days{j+1}.nc"
+                print(f"Submitting: {output_file}")
+                c.retrieve(
+                    'reanalysis-era5-pressure-levels',
+                    {
+                        'product_type': 'reanalysis',
+                        'variable': pl_vars,
+                        'pressure_level': levels,
+                        'year': str(year),
+                        'month': month,
+                        'day': days,
+                        'time': hours,
+                        'area': area,
+                        'format': 'netcdf',
+                    },
+                    output_file
+                )
+
+### Single Level Data Request
+c = cdsapi.Client()
+
+years = range(2011, 2021)
+months = ['03', '04', '05']
+hours = [f"{h:02d}:00" for h in range(0, 24)]
+
+area = [37.5, -93.0, 30.5, -80.5]  # [N, W, S, E]
+
+# Split month into 10-day batches
+days_groups = [
+    [f"{d:02d}" for d in range(1, 11)],
+    [f"{d:02d}" for d in range(11, 21)],
+    [f"{d:02d}" for d in range(21, 32)]
+]
+
+# Single-level
+sl_vars = [
+    "10m_u_component_of_wind", "10m_v_component_of_wind",
+    "2m_dewpoint_temperature", "2m_temperature",
+    "surface_pressure", "convective_available_potential_energy",
+    "convective_inhibition"
+]
+
+for year in years:
+    for month in months:
+        for j, days in enumerate(days_groups):
+            output_file = f"ERA5_SL_{year}_{month}_days{j+1}.nc"
+
+            # Skip if already exists
+            if os.path.exists(output_file):
+                print(f"Skipping existing file: {output_file}")
+                continue
+
+            print(f"Submitting: {output_file}")
+            c.retrieve(
+                'reanalysis-era5-single-levels',
+                {
+                    'product_type': 'reanalysis',
+                    'variable': sl_vars,
+                    'year': str(year),
+                    'month': month,
+                    'day': days,
+                    'time': hours,
+                    'area': area,
+                    'format': 'netcdf',
+                },
+                output_file
+            )
