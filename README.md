@@ -5,7 +5,7 @@ There are 5 files in this repository:
 1. CDS API Data Request
 2. Final ETL
 3. Manual Join
-4. EDA
+4. Final EDA
 5. Final Modeling
 
 These represent the final iterations of each stage.
