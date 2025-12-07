@@ -1,0 +1,89 @@
+### This EDA is focused on AL, as a representation of the broader data
+
+# Libraries
+import csv
+import pandas as pd
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+#cartopy for state border overlay
+#https://scitools.org.uk/cartopy/docs/v0.15/matplotlib/intro.html
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+# Read in preprocessed dataset
+AL_tornado_ds = xr.open_dataset("ERA5_SPC_merged.nc")
+
+# Grab a slice and inspect structure
+AL_tornado_ds.isel(time=slice(0, 24))
+
+# Including dataset legend for reference
+legend_df = pd.read_excel("Dataset_Legend.xlsx")
+
+styled_legend = (
+    legend_df.style
+    .set_caption("ERA5 + SPC Tornado Dataset Variable Legend")
+    .hide(axis = "index")
+    .set_table_styles([
+        {'selector': 'caption', 'props': [('font-size', '18px'), ('font-weight', 'bold'), ('color', 'black'), ('text-align', 'left')]},
+        {'selector': 'th', 'props': [('background-color', 'darkblue'), ('color', 'white'), ('text-align', 'center'), ('font-weight', 'bold')]},
+        {'selector': 'td', 'props': [('padding', '8px'), ('border', '1px solid #ccc')]},
+        {'selector': 'table', 'props': [('border-collapse', 'collapse'), ('width', '100%')]}
+    ])
+    .apply(lambda _: ['background-color: #f9f9f9']*len(legend_df.columns), axis=1)
+)
+
+styled_legend
+
+# Tornado class balance
+total_points = np.prod(AL_tornado_ds['tornado'].shape)
+num_tornado = int((AL_tornado_ds['tornado'] == 1).sum())
+num_notornado = int((AL_tornado_ds['tornado'] == 0).sum())
+
+print(f"Tornado points: {num_tornado:,}")
+print(f"Non-tornado points: {num_notornado:,}")
+print(f"Class ratio (tornado / total): {num_tornado / total_points:.6f}")
+
+# Subset for EDA Stats
+df = AL_tornado_ds.to_dataframe().reset_index()
+df[['t2m', 'd2m', 'sp', 'cape', 'cin']].describe()
+
+# Compare mean differences for tornado/non-tornado
+group_stats = df.groupby('tornado')[['t2m', 'd2m', 'cape', 'cin']].mean()
+display(group_stats)
+
+# Count tornadoes at each grid
+tornado_counts = AL_tornado_ds['tornado'].sum(dim='valid_time')
+
+# Cartopy for map projection
+proj = ccrs.PlateCarree()
+fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': proj})
+# Plot 
+tornado_plot = tornado_counts.plot(
+    ax=ax,
+    transform=proj,
+    cmap='Reds',
+    cbar_kwargs={'label': 'Tornado Count'},
+    add_colorbar=True
+)
+
+# State borders and coastline
+ax.add_feature(cfeature.STATES.with_scale('10m'), edgecolor='black', linewidth=1)
+ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=0.8)
+ax.add_feature(cfeature.BORDERS.with_scale('10m'), linewidth=0.8)
+# Focus map on Alabama
+ax.set_extent([-89, -84.5, 30, 35.2], crs=proj)
+
+ax.set_title("Tornado Frequency (Mar–May 2011, Alabama)", fontsize=14, pad=15)
+plt.show()
+
+# Correlation matrix with specified variables
+subset = df[['t2m', 'd2m', 'sp', 'cape', 'cin', 'tornado']].dropna()
+corr = subset.corr()
+corr.style.background_gradient(cmap='coolwarm', axis=None)
+
+# Seaborn to plot CAPE distrubution for tornado/non-tornado hours
+sns.kdeplot(data=subset, x='cape', hue='tornado', common_norm=False)
+plt.title("Distribution of CAPE for Tornadic vs. Non-Tornadic Hours")
+plt.show()
